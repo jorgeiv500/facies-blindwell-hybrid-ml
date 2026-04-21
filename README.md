@@ -94,6 +94,23 @@ Outputs will be written to:
 - `outputs/results`
 - `outputs/figures`
 
+Figures are exported in both `.png` and `.pdf` formats so the public repository can be reused directly in manuscripts, slides, and peer-review responses.
+
+## Figure Inventory
+
+The figure set is designed around what reservoir characterization and applied ML journals typically expect: depth-based prediction tracks, blind-well diagnostics, petrophysical context, uncertainty, and interpretability.
+
+- `figure_1_workflow`: hybrid leakage-aware workflow
+- `figure_2_window`: depth-window construction for the sequence model
+- `figure_3_random_vs_blind`: optimism gap between random split and blind-well validation
+- `figure_4_model_comparison`: blind-well metric comparison across models
+- `figure_5_depth_predictions`: multi-track blind-well panel with GR, PHID, RT, and facies strips
+- `figure_6_uncertainty`: hybrid class probabilities, confidence, entropy, margin, and MC-dropout variance
+- `figure_7_shap_attention`: SHAP-based feature ranking and attention profile
+- `figure_8_crossplots`: petrophysical crossplots colored by facies
+- `figure_9_confusion_matrices`: row-normalized blind-well confusion matrices
+- `figure_10_dataset_context`: relative-depth facies architecture by well and facies composition by formation
+
 ## Rebuild the Public Dataset
 
 If you have legitimate access to the private source spreadsheet, you can regenerate the public dataset with:
@@ -107,6 +124,7 @@ python src/anonymize_dataset.py --input-path /path/to/private_source.xlsx
 - The experiment never uses blind-well samples during preprocessing, tuning, or probability fusion.
 - `PEF` is excluded from the main modeling workflow because it is completely missing in one well.
 - The public repository is intended to make the computational workflow auditable and rerunnable from anonymized data.
+- The public dataset does not include well coordinates or structural surfaces, so the repository avoids pseudo-maps or reservoir reconstructions that would not be supported by the released data.
 
 ## Tested Environment
 

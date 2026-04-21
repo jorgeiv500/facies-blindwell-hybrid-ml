@@ -16,12 +16,14 @@ import shap
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
-from matplotlib.colors import ListedColormap
+from matplotlib.colors import BoundaryNorm, ListedColormap
+from matplotlib.patches import FancyBboxPatch, Patch
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import (
     accuracy_score,
     balanced_accuracy_score,
+    confusion_matrix,
     f1_score,
     log_loss,
 )
@@ -37,6 +39,22 @@ MAX_EPOCHS = 30
 PATIENCE = 4
 BATCH_SIZE = 128
 MC_PASSES = 10
+
+FACIES_COLORS = [
+    "#264653",
+    "#2A9D8F",
+    "#E9C46A",
+    "#F4A261",
+    "#E76F51",
+    "#7F5539",
+    "#6D597A",
+    "#577590",
+]
+
+VALIDATION_PALETTE = {
+    "RandomSplit": "#B8D8D8",
+    "BlindWell": "#1D3557",
+}
 
 
 @dataclass
@@ -87,6 +105,88 @@ def load_table(path: Path) -> pd.DataFrame:
     if suffix in {".xlsx", ".xls"}:
         return pd.read_excel(path)
     raise ValueError(f"Unsupported data format: {path}")
+
+
+def set_publication_style() -> None:
+    sns.set_theme(
+        context="paper",
+        style="whitegrid",
+        font_scale=1.05,
+        rc={
+            "axes.facecolor": "#fcfcfc",
+            "figure.facecolor": "white",
+            "axes.edgecolor": "#b0b0b0",
+            "grid.color": "#d9d9d9",
+            "grid.linewidth": 0.6,
+            "axes.spines.top": False,
+            "axes.spines.right": False,
+            "axes.titleweight": "bold",
+            "axes.labelweight": "bold",
+        },
+    )
+
+
+def save_figure(fig: plt.Figure, output_path: Path) -> None:
+    fig.savefig(output_path, dpi=400, bbox_inches="tight", facecolor="white")
+    fig.savefig(output_path.with_suffix(".pdf"), bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+
+
+def get_facies_style(
+    facies_labels: list[int],
+) -> tuple[list[int], list[str], ListedColormap, BoundaryNorm, dict[int, int]]:
+    ordered = [int(label) for label in facies_labels]
+    colors = FACIES_COLORS[: len(ordered)]
+    cmap = ListedColormap(colors)
+    norm = BoundaryNorm(np.arange(len(ordered) + 1) - 0.5, cmap.N)
+    index_map = {label: idx for idx, label in enumerate(ordered)}
+    return ordered, colors, cmap, norm, index_map
+
+
+def encode_facies(values: pd.Series | np.ndarray, index_map: dict[int, int]) -> np.ndarray:
+    return np.array([index_map[int(value)] for value in values], dtype=int)
+
+
+def draw_facies_strip(
+    ax: plt.Axes,
+    depth: np.ndarray,
+    facies_values: pd.Series | np.ndarray,
+    index_map: dict[int, int],
+    cmap: ListedColormap,
+    norm: BoundaryNorm,
+    title: str,
+    show_ylabel: bool = False,
+) -> None:
+    encoded = encode_facies(facies_values, index_map)[:, None]
+    ax.imshow(
+        encoded,
+        aspect="auto",
+        cmap=cmap,
+        norm=norm,
+        interpolation="nearest",
+        extent=[0, 1, float(depth.max()), float(depth.min())],
+    )
+    ax.set_title(title, fontsize=11, pad=8)
+    ax.set_xticks([])
+    ax.grid(False)
+    if show_ylabel:
+        ax.set_ylabel("Depth")
+    else:
+        ax.tick_params(axis="y", labelleft=False)
+
+
+def add_facies_legend(fig: plt.Figure, facies_labels: list[int], facies_colors: list[str], anchor_y: float = 0.0) -> None:
+    handles = [
+        Patch(facecolor=color, edgecolor="none", label=f"Facies {label}")
+        for label, color in zip(facies_labels, facies_colors)
+    ]
+    fig.legend(
+        handles=handles,
+        loc="lower center",
+        ncol=min(4, len(handles)),
+        frameon=False,
+        bbox_to_anchor=(0.5, anchor_y),
+    )
 
 
 def load_dataset(config: ExperimentConfig) -> ModelingBundle:
@@ -951,6 +1051,7 @@ def save_artifacts(
             indent=2,
         )
 
+    facies_labels = [int(label) for label in bundle.label_encoder.classes_]
     print("[Artifacts] rendering workflow figures", flush=True)
     plot_workflow(config.figures_dir / "figure_1_workflow.png")
     plot_window_construction(config.figures_dir / "figure_2_window.png", bundle, config.window_size)
@@ -958,12 +1059,15 @@ def save_artifacts(
     plot_model_comparison(summary_df, config.figures_dir / "figure_4_model_comparison.png")
     print(f"[Artifacts] rendering depth and uncertainty figures for {representative_well}", flush=True)
     plot_depth_predictions(
+        bundle,
         predictions_df,
+        facies_labels,
         representative_well,
         config.figures_dir / "figure_5_depth_predictions.png",
     )
     plot_uncertainty(
         predictions_df,
+        facies_labels,
         representative_well,
         config.figures_dir / "figure_6_uncertainty.png",
     )
@@ -978,127 +1082,298 @@ def save_artifacts(
         representative_well=representative_well,
         output_path=config.figures_dir / "figure_7_shap_attention.png",
     )
+    plot_petrophysical_crossplots(bundle.df, facies_labels, config.figures_dir / "figure_8_crossplots.png")
+    plot_confusion_matrices(predictions_df, facies_labels, config.figures_dir / "figure_9_confusion_matrices.png")
+    plot_facies_context(bundle.df, facies_labels, config.figures_dir / "figure_10_dataset_context.png")
 
 
 def plot_workflow(output_path: Path) -> None:
-    sns.set_theme(style="whitegrid")
-    fig, ax = plt.subplots(figsize=(12, 4))
+    set_publication_style()
+    fig, ax = plt.subplots(figsize=(13, 4.8))
     ax.axis("off")
+
     boxes = [
-        "Well logs\n+ QC",
-        "Leakage-aware\nsplit by well",
-        "Tabular branch\nRF / GB / XGB",
-        "Sequence branch\n1D-CNN + BiLSTM + Attention",
-        "Probability\nfusion",
-        "Uncertainty\n+ interpretability",
-        "Facies along\ndepth",
+        (0.10, 0.50, 0.18, 0.18, "Well logs\nQC + harmonization", "#DCEAF4"),
+        (0.30, 0.50, 0.18, 0.18, "Leakage-aware\nblind-well split", "#E9F5DB"),
+        (0.52, 0.68, 0.19, 0.18, "Tabular branch\nRF / GB / XGB", "#D9EAF7"),
+        (0.52, 0.32, 0.23, 0.18, "Sequence branch\n1D-CNN + BiLSTM + Attention", "#FDE2C5"),
+        (0.77, 0.50, 0.17, 0.18, "Probability\nfusion", "#EADFF8"),
+        (0.92, 0.50, 0.17, 0.18, "Blind-well facies\nuncertainty + interpretation", "#F7D9D9"),
     ]
-    x_positions = np.linspace(0.05, 0.95, len(boxes))
-    for xpos, label in zip(x_positions, boxes):
-        ax.text(
-            xpos,
-            0.5,
-            label,
-            ha="center",
-            va="center",
-            fontsize=12,
-            bbox={"boxstyle": "round,pad=0.45", "facecolor": "#e8f1f8", "edgecolor": "#24557a"},
+
+    for x, y, w, h, label, color in boxes:
+        patch = FancyBboxPatch(
+            (x - w / 2, y - h / 2),
+            w,
+            h,
+            boxstyle="round,pad=0.02,rounding_size=0.02",
+            linewidth=1.5,
+            edgecolor="#37515f",
+            facecolor=color,
         )
-    for start, end in zip(x_positions[:-1], x_positions[1:]):
-        ax.annotate("", xy=(end - 0.05, 0.5), xytext=(start + 0.05, 0.5), arrowprops={"arrowstyle": "->", "lw": 1.8})
+        ax.add_patch(patch)
+        ax.text(x, y, label, ha="center", va="center", fontsize=11, color="#22313f")
+
+    arrows = [
+        ((0.19, 0.50), (0.22, 0.50)),
+        ((0.39, 0.56), (0.43, 0.65)),
+        ((0.39, 0.44), (0.41, 0.35)),
+        ((0.63, 0.62), (0.69, 0.54)),
+        ((0.64, 0.38), (0.69, 0.46)),
+        ((0.85, 0.50), (0.87, 0.50)),
+    ]
+    for start, end in arrows:
+        ax.annotate("", xy=end, xytext=start, arrowprops={"arrowstyle": "->", "lw": 2.0, "color": "#445d6e"})
+
+    ax.set_title("Hybrid reliable facies-classification workflow", fontsize=15, pad=10)
     fig.tight_layout()
-    fig.savefig(output_path, dpi=300, bbox_inches="tight")
-    plt.close(fig)
+    save_figure(fig, output_path)
 
 
 def plot_window_construction(output_path: Path, bundle: ModelingBundle, window_size: int) -> None:
+    set_publication_style()
     well = bundle.df["Well_ID"].iloc[0]
-    group = bundle.df[bundle.df["Well_ID"] == well].head(25).copy()
+    group = bundle.df[bundle.df["Well_ID"] == well].head(30).copy()
     half = window_size // 2
     center = half + 4
-    fig, ax = plt.subplots(figsize=(10, 4))
-    ax.plot(group["Depth"], group["GR"], color="#24557a", lw=2, label="GR")
-    ax.axvspan(group.iloc[center - half]["Depth"], group.iloc[center + half]["Depth"], color="#9fd3c7", alpha=0.35)
-    ax.axvline(group.iloc[center]["Depth"], color="#b23a48", ls="--", lw=2, label="Target facies")
-    ax.set_xlabel("Depth")
-    ax.set_ylabel("Gamma Ray")
-    ax.set_title("Depth-centered window for the sequence model")
-    ax.legend(frameon=True)
+    left_depth = group.iloc[center - half]["Depth"]
+    right_depth = group.iloc[center + half]["Depth"]
+
+    fig, axes = plt.subplots(2, 1, figsize=(10.5, 5.8), sharex=True, gridspec_kw={"hspace": 0.08})
+    tracks = [
+        ("GR", "#2A6F97", "Gamma ray"),
+        ("RT", "#9C6644", "True resistivity"),
+    ]
+    for ax, (column, color, title) in zip(axes, tracks):
+        ax.plot(group["Depth"], group[column], color=color, lw=2)
+        ax.axvspan(left_depth, right_depth, color="#F4D58D", alpha=0.35)
+        ax.axvline(group.iloc[center]["Depth"], color="#C1121F", ls="--", lw=1.8)
+        ax.set_ylabel(title)
+        ax.text(group.iloc[center]["Depth"], ax.get_ylim()[1], " target ", color="#C1121F", ha="left", va="top")
+    axes[1].set_xlabel("Depth")
+    fig.suptitle(f"Depth-centered window used by the sequence model ({well})", y=0.99)
     fig.tight_layout()
-    fig.savefig(output_path, dpi=300, bbox_inches="tight")
-    plt.close(fig)
+    save_figure(fig, output_path)
 
 
 def plot_random_vs_blind(summary_df: pd.DataFrame, output_path: Path) -> None:
-    plot_df = summary_df[summary_df["Model"].isin(["ProbabilisticEnsemble", "CNN_BiLSTM_Attention", "HybridFusion"])].copy()
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4.8))
-    sns.barplot(data=plot_df, x="Model", y="accuracy", hue="Validation", ax=axes[0], palette="Set2")
-    sns.barplot(data=plot_df, x="Model", y="macro_f1", hue="Validation", ax=axes[1], palette="Set2")
-    axes[0].set_title("Accuracy by validation protocol")
-    axes[1].set_title("Macro-F1 by validation protocol")
-    for ax in axes:
-        ax.tick_params(axis="x", rotation=25)
-        ax.set_xlabel("")
+    set_publication_style()
+    model_order = ["RandomForest", "ProbabilisticEnsemble", "CNN_BiLSTM_Attention", "HybridFusion"]
+    model_labels = {
+        "RandomForest": "RF",
+        "ProbabilisticEnsemble": "Ensemble",
+        "CNN_BiLSTM_Attention": "CNN-BiLSTM-Attn",
+        "HybridFusion": "Hybrid",
+    }
+    plot_df = summary_df[summary_df["Model"].isin(model_order)].copy()
+    fig, axes = plt.subplots(1, 2, figsize=(12.5, 5.2), sharey=True)
+
+    for ax, (metric, title) in zip(axes, [("accuracy", "Accuracy"), ("macro_f1", "Macro-F1")]):
+        pivot = plot_df.pivot(index="Model", columns="Validation", values=metric).loc[model_order]
+        y = np.arange(len(model_order))
+        ax.hlines(y, pivot["BlindWell"], pivot["RandomSplit"], color="#c7c7c7", lw=2.2, zorder=1)
+        ax.scatter(
+            pivot["RandomSplit"],
+            y,
+            s=80,
+            color=VALIDATION_PALETTE["RandomSplit"],
+            edgecolor="white",
+            linewidth=0.7,
+            label="Random split",
+            zorder=3,
+        )
+        ax.scatter(
+            pivot["BlindWell"],
+            y,
+            s=80,
+            color=VALIDATION_PALETTE["BlindWell"],
+            edgecolor="white",
+            linewidth=0.7,
+            label="Blind well",
+            zorder=3,
+        )
+        for yi, (_, row) in enumerate(pivot.iterrows()):
+            delta = row["BlindWell"] - row["RandomSplit"]
+            ax.text(max(row["RandomSplit"], row["BlindWell"]) + 0.01, yi, f"{delta:+.02f}", va="center", fontsize=9)
+        ax.set_yticks(y)
+        ax.set_yticklabels([model_labels[name] for name in model_order])
+        ax.set_xlabel(title)
+        ax.set_title(f"{title}: optimism gap from random to blind-well testing")
+        ax.set_xlim(max(0.0, pivot.min().min() - 0.08), min(1.02, pivot.max().max() + 0.10))
+
+    handles, labels = axes[0].get_legend_handles_labels()
+    axes[0].legend(handles[:2], labels[:2], loc="lower left", frameon=True)
     fig.tight_layout()
-    fig.savefig(output_path, dpi=300, bbox_inches="tight")
-    plt.close(fig)
+    save_figure(fig, output_path)
 
 
 def plot_model_comparison(summary_df: pd.DataFrame, output_path: Path) -> None:
+    set_publication_style()
     blind_df = summary_df[summary_df["Validation"] == "BlindWell"].copy()
-    blind_df = blind_df.set_index("Model")[
-        ["accuracy", "balanced_accuracy", "macro_f1", "weighted_f1", "log_loss", "brier_score"]
+    blind_df = blind_df.set_index("Model").loc[
+        [
+            "RandomForest",
+            "ProbabilisticEnsemble",
+            "XGBoost",
+            "GradientBoosting",
+            "HybridFusion",
+            "CNN_BiLSTM_Attention",
+            "CNN_BiLSTM",
+            "CNN",
+        ]
     ]
-    fig, ax = plt.subplots(figsize=(10, 5))
-    sns.heatmap(blind_df, annot=True, fmt=".3f", cmap="YlGnBu", ax=ax)
-    ax.set_title("Blind-well model comparison")
+    fig, axes = plt.subplots(1, 2, figsize=(12.8, 5.3), gridspec_kw={"width_ratios": [2.2, 1.2]})
+    higher_better = blind_df[["accuracy", "balanced_accuracy", "macro_f1", "weighted_f1"]]
+    lower_better = blind_df[["log_loss", "brier_score"]]
+    sns.heatmap(higher_better, annot=True, fmt=".3f", cmap="YlGnBu", ax=axes[0], cbar_kws={"shrink": 0.7})
+    sns.heatmap(lower_better, annot=True, fmt=".3f", cmap="YlOrRd_r", ax=axes[1], cbar_kws={"shrink": 0.7})
+    axes[0].set_title("Blind-well discrimination metrics (higher is better)")
+    axes[1].set_title("Blind-well probability errors (lower is better)")
     fig.tight_layout()
-    fig.savefig(output_path, dpi=300, bbox_inches="tight")
-    plt.close(fig)
+    save_figure(fig, output_path)
 
 
-def plot_depth_predictions(predictions_df: pd.DataFrame, well_id: str, output_path: Path) -> None:
+def plot_depth_predictions(
+    bundle: ModelingBundle,
+    predictions_df: pd.DataFrame,
+    facies_labels: list[int],
+    well_id: str,
+    output_path: Path,
+) -> None:
+    set_publication_style()
     subset = predictions_df[
         (predictions_df["Validation"] == "BlindWell")
         & (predictions_df["SplitLabel"] == f"Blind_{well_id}")
         & (predictions_df["Model"].isin(["ProbabilisticEnsemble", "CNN_BiLSTM_Attention", "HybridFusion"]))
     ].copy()
-    facies_palette = ListedColormap(sns.color_palette("tab10", n_colors=8))
-    fig, axes = plt.subplots(4, 1, figsize=(8, 10), sharex=True)
+    logs = bundle.core_df[bundle.core_df["Well_ID"] == well_id].sort_values("Depth").copy()
     truth = subset[subset["Model"] == "HybridFusion"].sort_values("Depth")
-    axes[0].scatter(truth["Depth"], np.ones(len(truth)), c=truth["Facies"], cmap=facies_palette, s=22)
-    axes[0].set_ylabel("True")
-    axes[0].set_yticks([])
-    for ax_idx, model_name in enumerate(["ProbabilisticEnsemble", "CNN_BiLSTM_Attention", "HybridFusion"], start=1):
-        df_model = subset[subset["Model"] == model_name].sort_values("Depth")
-        axes[ax_idx].scatter(df_model["Depth"], np.ones(len(df_model)), c=df_model["PredFacies"], cmap=facies_palette, s=22)
-        axes[ax_idx].set_ylabel(model_name)
-        axes[ax_idx].set_yticks([])
-    axes[-1].set_xlabel("Depth")
-    fig.suptitle(f"Blind-well facies prediction along depth: {well_id}", y=1.02)
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=300, bbox_inches="tight")
-    plt.close(fig)
+    facies_labels, facies_colors, cmap, norm, index_map = get_facies_style(facies_labels)
+
+    fig, axes = plt.subplots(
+        1,
+        7,
+        figsize=(15.5, 9.2),
+        sharey=True,
+        gridspec_kw={"width_ratios": [1.35, 1.15, 1.35, 0.36, 0.36, 0.36, 0.36], "wspace": 0.08},
+    )
+
+    depth = logs["Depth"].to_numpy()
+    axes[0].plot(logs["GR"], depth, color="#2A6F97", lw=1.8)
+    axes[0].fill_betweenx(depth, logs["GR"].min(), logs["GR"], color="#8ECAE6", alpha=0.35)
+    axes[0].set_title("GR")
+    axes[0].set_xlabel("gAPI")
+    axes[0].set_ylabel("Depth")
+
+    axes[1].plot(logs["PHID"], depth, color="#F4A261", lw=1.8)
+    axes[1].fill_betweenx(depth, logs["PHID"].min(), logs["PHID"], color="#F6BD60", alpha=0.35)
+    axes[1].set_title("PHID")
+    axes[1].set_xlabel("v/v")
+
+    rt_track = np.clip(logs["RT"].to_numpy(), 1e-2, None)
+    axes[2].plot(rt_track, depth, color="#9C6644", lw=1.8)
+    axes[2].set_xscale("log")
+    axes[2].set_title("RT")
+    axes[2].set_xlabel("ohm.m")
+
+    draw_facies_strip(axes[3], truth["Depth"].to_numpy(), truth["Facies"], index_map, cmap, norm, "True")
+    draw_facies_strip(
+        axes[4],
+        truth["Depth"].to_numpy(),
+        subset[subset["Model"] == "ProbabilisticEnsemble"].sort_values("Depth")["PredFacies"],
+        index_map,
+        cmap,
+        norm,
+        "Ensemble",
+    )
+    draw_facies_strip(
+        axes[5],
+        truth["Depth"].to_numpy(),
+        subset[subset["Model"] == "CNN_BiLSTM_Attention"].sort_values("Depth")["PredFacies"],
+        index_map,
+        cmap,
+        norm,
+        "DL",
+    )
+    draw_facies_strip(
+        axes[6],
+        truth["Depth"].to_numpy(),
+        subset[subset["Model"] == "HybridFusion"].sort_values("Depth")["PredFacies"],
+        index_map,
+        cmap,
+        norm,
+        "Hybrid",
+    )
+
+    for ax in axes[:3]:
+        ax.set_ylim(depth.max(), depth.min())
+    fig.suptitle(f"Blind-well multi-track panel: {well_id}", y=0.99)
+    add_facies_legend(fig, facies_labels, facies_colors, anchor_y=0.01)
+    fig.tight_layout(rect=[0, 0.05, 1, 0.98])
+    save_figure(fig, output_path)
 
 
-def plot_uncertainty(predictions_df: pd.DataFrame, well_id: str, output_path: Path) -> None:
+def plot_uncertainty(
+    predictions_df: pd.DataFrame,
+    facies_labels: list[int],
+    well_id: str,
+    output_path: Path,
+) -> None:
+    set_publication_style()
     subset = predictions_df[
         (predictions_df["Validation"] == "BlindWell")
         & (predictions_df["SplitLabel"] == f"Blind_{well_id}")
         & (predictions_df["Model"] == "HybridFusion")
     ].copy().sort_values("Depth")
-    fig, axes = plt.subplots(3, 1, figsize=(9, 8), sharex=True)
-    axes[0].plot(subset["Depth"], subset["Confidence"], color="#24557a", lw=1.8)
-    axes[0].set_ylabel("Confidence")
-    axes[1].plot(subset["Depth"], subset["Entropy"], color="#b23a48", lw=1.8)
-    axes[1].set_ylabel("Entropy")
-    axes[2].plot(subset["Depth"], subset["Margin"], color="#2d6a4f", lw=1.8)
-    axes[2].set_ylabel("Top1-Top2")
-    axes[2].set_xlabel("Depth")
-    fig.suptitle(f"Hybrid uncertainty along depth: {well_id}", y=1.02)
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=300, bbox_inches="tight")
-    plt.close(fig)
+    facies_labels, facies_colors, cmap, norm, index_map = get_facies_style(facies_labels)
+    prob_cols = [f"Prob_{label}" for label in facies_labels]
+    prob_matrix = subset[prob_cols].to_numpy().T
+
+    fig, axes = plt.subplots(
+        1,
+        7,
+        figsize=(17.2, 9.2),
+        sharey=True,
+        gridspec_kw={"width_ratios": [0.36, 0.36, 1.8, 0.9, 0.9, 0.9, 0.9], "wspace": 0.08},
+    )
+    depth = subset["Depth"].to_numpy()
+    draw_facies_strip(axes[0], depth, subset["Facies"], index_map, cmap, norm, "True", show_ylabel=True)
+    draw_facies_strip(axes[1], depth, subset["PredFacies"], index_map, cmap, norm, "Hybrid")
+
+    heatmap = axes[2].imshow(
+        prob_matrix,
+        aspect="auto",
+        cmap="viridis",
+        vmin=0.0,
+        vmax=1.0,
+        interpolation="nearest",
+        extent=[-0.5, len(facies_labels) - 0.5, float(depth.max()), float(depth.min())],
+    )
+    axes[2].set_title("Hybrid class probabilities")
+    axes[2].set_xticks(np.arange(len(facies_labels)))
+    axes[2].set_xticklabels([str(label) for label in facies_labels], rotation=45, ha="right")
+    axes[2].set_xlabel("Facies")
+    axes[2].grid(False)
+
+    metrics = [
+        ("Confidence", "#1D3557", "Pmax", (0.0, 1.02)),
+        ("Entropy", "#C1121F", "Entropy", (0.0, max(1.0, float(subset["Entropy"].max()) * 1.05))),
+        ("Margin", "#2A9D8F", "Top1-Top2", (0.0, 1.02)),
+        ("DLVariance", "#6D597A", "MC var", (0.0, max(0.01, float(subset["DLVariance"].max()) * 1.10))),
+    ]
+    for ax, (column, color, xlabel, xlim) in zip(axes[3:], metrics):
+        ax.plot(subset[column], depth, color=color, lw=1.7)
+        ax.fill_betweenx(depth, 0, subset[column], color=color, alpha=0.15)
+        ax.set_title(column)
+        ax.set_xlabel(xlabel)
+        ax.set_xlim(*xlim)
+
+    cbar = fig.colorbar(heatmap, ax=axes[2], fraction=0.045, pad=0.02)
+    cbar.set_label("Probability")
+    fig.suptitle(f"Hybrid probability and uncertainty diagnostics: {well_id}", y=0.99)
+    add_facies_legend(fig, facies_labels, facies_colors, anchor_y=0.01)
+    fig.tight_layout(rect=[0, 0.05, 1, 0.98])
+    save_figure(fig, output_path)
 
 
 def plot_shap_and_attention(
@@ -1111,6 +1386,7 @@ def plot_shap_and_attention(
     representative_well: str,
     output_path: Path,
 ) -> None:
+    set_publication_style()
     explainer = shap.TreeExplainer(xgb_model)
     sample = x_tab_train[: min(300, len(x_tab_train))]
     shap_values = explainer.shap_values(sample)
@@ -1127,21 +1403,177 @@ def plot_shap_and_attention(
     attn_df = attn_df.sort_values("Depth").reset_index(drop=True)
     n_rows = min(len(attn_df), attention_weights.shape[0])
     averaged_attention = attention_weights[:n_rows].mean(axis=0)
+    spread_attention = attention_weights[:n_rows].std(axis=0)
+    top_idx = np.argsort(values)[-10:]
+    top_values = values[top_idx]
+    top_features = np.array(feature_names)[top_idx]
+    order = np.argsort(top_values)
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
-    order = np.argsort(values)
-    axes[0].barh(np.array(feature_names)[order], values[order], color="#24557a")
-    axes[0].set_title("Mean |SHAP| for XGBoost")
+    fig, axes = plt.subplots(1, 2, figsize=(12.5, 4.8), gridspec_kw={"width_ratios": [1.3, 1.0]})
+    axes[0].barh(top_features[order], top_values[order], color=sns.color_palette("crest", len(order)))
+    axes[0].set_title("Top XGBoost drivers from SHAP")
     axes[0].set_xlabel("Importance")
 
-    axes[1].plot(np.arange(len(averaged_attention)), averaged_attention, color="#b23a48", lw=2)
-    axes[1].fill_between(np.arange(len(averaged_attention)), 0, averaged_attention, color="#f4acb7", alpha=0.35)
-    axes[1].set_title(f"Average attention window weights: {representative_well}")
-    axes[1].set_xlabel("Window position")
+    positions = np.arange(len(averaged_attention)) - len(averaged_attention) // 2
+    axes[1].plot(positions, averaged_attention, color="#C1121F", lw=2)
+    axes[1].fill_between(
+        positions,
+        np.maximum(averaged_attention - spread_attention, 0),
+        averaged_attention + spread_attention,
+        color="#F4ACB7",
+        alpha=0.35,
+    )
+    axes[1].axvline(0, color="#6c757d", ls="--", lw=1.2)
+    axes[1].set_title(f"Attention profile around target depth ({representative_well})")
+    axes[1].set_xlabel("Window position relative to target")
     axes[1].set_ylabel("Weight")
     fig.tight_layout()
-    fig.savefig(output_path, dpi=300, bbox_inches="tight")
-    plt.close(fig)
+    save_figure(fig, output_path)
+
+
+def plot_petrophysical_crossplots(raw_df: pd.DataFrame, facies_labels: list[int], output_path: Path) -> None:
+    set_publication_style()
+    sample_df = raw_df.sample(n=min(3500, len(raw_df)), random_state=SEED).copy()
+    facies_labels, facies_colors, _, _, _ = get_facies_style(facies_labels)
+    color_map = dict(zip(facies_labels, facies_colors))
+
+    panels = [
+        ("GR", "PHID", "GR vs PHID", "linear"),
+        ("RHOB", "PHIE", "RHOB vs PHIE", "linear"),
+        ("RT", "PHIE", "RT vs PHIE", "log"),
+        ("Vshl", "SwA", "Vshl vs SwA", "linear"),
+    ]
+    fig, axes = plt.subplots(2, 2, figsize=(12.5, 10.2))
+    for ax, (x_col, y_col, title, scale) in zip(axes.ravel(), panels):
+        panel_df = sample_df[[x_col, y_col, "Facies"]].dropna().copy()
+        if scale == "log":
+            panel_df = panel_df[panel_df[x_col] > 0]
+        for facies in facies_labels:
+            subset = panel_df[panel_df["Facies"] == facies]
+            ax.scatter(
+                subset[x_col],
+                subset[y_col],
+                s=16,
+                alpha=0.40,
+                color=color_map[facies],
+                edgecolor="none",
+            )
+        centroids = panel_df.groupby("Facies")[[x_col, y_col]].median().reindex(facies_labels)
+        ax.scatter(
+            centroids[x_col],
+            centroids[y_col],
+            s=90,
+            c=[color_map[label] for label in facies_labels],
+            edgecolor="black",
+            linewidth=0.7,
+            marker="X",
+            zorder=4,
+        )
+        if scale == "log":
+            ax.set_xscale("log")
+        ax.set_xlabel(x_col)
+        ax.set_ylabel(y_col)
+        ax.set_title(title)
+
+    legend_handles = [
+        Patch(facecolor=color_map[label], edgecolor="none", label=f"Facies {label}")
+        for label in facies_labels
+    ]
+    fig.legend(handles=legend_handles, loc="lower center", ncol=min(4, len(legend_handles)), frameon=False)
+    fig.suptitle("Petrophysical crossplots from the anonymized reservoir dataset", y=0.99)
+    fig.tight_layout(rect=[0, 0.05, 1, 0.98])
+    save_figure(fig, output_path)
+
+
+def plot_confusion_matrices(predictions_df: pd.DataFrame, facies_labels: list[int], output_path: Path) -> None:
+    set_publication_style()
+    blind_df = predictions_df[predictions_df["Validation"] == "BlindWell"].copy()
+    model_order = ["RandomForest", "ProbabilisticEnsemble", "CNN_BiLSTM_Attention", "HybridFusion"]
+    model_labels = {
+        "RandomForest": "RF",
+        "ProbabilisticEnsemble": "Ensemble",
+        "CNN_BiLSTM_Attention": "CNN-BiLSTM-Attn",
+        "HybridFusion": "Hybrid",
+    }
+
+    fig, axes = plt.subplots(2, 2, figsize=(10.5, 9.2), sharex=True, sharey=True)
+    cbar_ax = fig.add_axes([0.92, 0.18, 0.02, 0.64])
+    for idx, (ax, model_name) in enumerate(zip(axes.ravel(), model_order)):
+        subset = blind_df[blind_df["Model"] == model_name]
+        cm = confusion_matrix(
+            subset["Facies"],
+            subset["PredFacies"],
+            labels=facies_labels,
+            normalize="true",
+        )
+        sns.heatmap(
+            cm,
+            annot=True,
+            fmt=".2f",
+            cmap="Blues",
+            vmin=0.0,
+            vmax=1.0,
+            ax=ax,
+            xticklabels=facies_labels,
+            yticklabels=facies_labels,
+            cbar=idx == 0,
+            cbar_ax=cbar_ax if idx == 0 else None,
+        )
+        ax.set_title(model_labels[model_name])
+        ax.set_xlabel("Predicted facies")
+        ax.set_ylabel("True facies")
+    fig.suptitle("Blind-well confusion matrices (row-normalized)", y=0.98)
+    fig.tight_layout(rect=[0, 0, 0.91, 0.97])
+    save_figure(fig, output_path)
+
+
+def plot_facies_context(raw_df: pd.DataFrame, facies_labels: list[int], output_path: Path) -> None:
+    set_publication_style()
+    facies_labels, facies_colors, cmap, norm, index_map = get_facies_style(facies_labels)
+    wells = sorted(raw_df["Well_ID"].unique())
+    formation_dist = (
+        pd.crosstab(raw_df["Formation"], raw_df["Facies"], normalize="index")
+        .reindex(columns=facies_labels, fill_value=0.0)
+        .sort_index()
+    )
+
+    fig = plt.figure(figsize=(14.5, 6.0))
+    grid = fig.add_gridspec(1, len(wells) + 1, width_ratios=[0.32] * len(wells) + [1.8], wspace=0.10)
+    strip_axes = [fig.add_subplot(grid[0, idx]) for idx in range(len(wells))]
+    heatmap_ax = fig.add_subplot(grid[0, -1])
+
+    for idx, (ax, well_id) in enumerate(zip(strip_axes, wells)):
+        well_df = raw_df[raw_df["Well_ID"] == well_id].sort_values("RelDepth")
+        draw_facies_strip(
+            ax,
+            well_df["RelDepth"].to_numpy(),
+            well_df["Facies"],
+            index_map,
+            cmap,
+            norm,
+            well_id.replace("_", "\n"),
+            show_ylabel=idx == 0,
+        )
+        if idx == 0:
+            ax.set_ylabel("Relative depth")
+
+    sns.heatmap(
+        formation_dist,
+        annot=True,
+        fmt=".2f",
+        cmap="YlGnBu",
+        vmin=0.0,
+        vmax=max(0.5, float(formation_dist.max().max())),
+        ax=heatmap_ax,
+        cbar_kws={"shrink": 0.75, "label": "Within-formation fraction"},
+    )
+    heatmap_ax.set_title("Facies composition by formation")
+    heatmap_ax.set_xlabel("Facies")
+    heatmap_ax.set_ylabel("Formation")
+    add_facies_legend(fig, facies_labels, facies_colors, anchor_y=-0.01)
+    fig.suptitle("Dataset context: relative-depth facies architecture and stratigraphic composition", y=0.99)
+    fig.tight_layout(rect=[0, 0.04, 1, 0.97])
+    save_figure(fig, output_path)
 
 
 def parse_args() -> argparse.Namespace:
