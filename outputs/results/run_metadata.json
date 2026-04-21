@@ -1,0 +1,13 @@
+{
+  "data_path": "/Users/jorgeiv500/Documents/facies-ml-public/data/facies_logs_anonymized.csv",
+  "window_size": 11,
+  "seed": 42,
+  "max_epochs": 30,
+  "patience": 4,
+  "batch_size": 128,
+  "mc_passes": 10,
+  "representative_well": "Well_06",
+  "n_raw_samples": 4253,
+  "n_windowed_samples": 4193,
+  "n_wells": 6
+}

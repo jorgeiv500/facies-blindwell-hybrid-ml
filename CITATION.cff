@@ -1,0 +1,16 @@
+cff-version: 1.2.0
+title: "Facies Blind-Well Hybrid ML"
+message: "If you use this repository, please cite the repository and the associated manuscript."
+type: software
+authors:
+  - family-names: "Herrera-Valero"
+    given-names: "Hector"
+    orcid: "https://orcid.org/0009-0000-0052-9615"
+  - family-names: "Romero-Gelvez"
+    given-names: "Jorge Ivan"
+    orcid: "https://orcid.org/0000-0002-5335-0819"
+  - family-names: "Zapata"
+    given-names: "Sebastian"
+    orcid: "https://orcid.org/0000-0002-4836-8328"
+repository-code: "https://github.com/jorgeiv500/facies-blindwell-hybrid-ml"
+license: "MIT"

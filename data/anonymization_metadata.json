@@ -1,0 +1,32 @@
+{
+  "anonymization_steps": [
+    "Well identifiers replaced with sequential labels.",
+    "Formation identifiers replaced with sequential labels.",
+    "Depth values shifted so each well starts at zero while preserving sampling intervals.",
+    "Petrophysical measurements and facies labels preserved."
+  ],
+  "n_rows": 4253,
+  "n_wells": 6,
+  "n_formations": 5,
+  "columns": [
+    "Nombre",
+    "Formacion",
+    "Depth",
+    "NetRes",
+    "BVW",
+    "GR",
+    "PEF",
+    "PHID",
+    "PHIE",
+    "PHIN",
+    "ResD",
+    "ResM",
+    "ResS",
+    "RHOB",
+    "Ro",
+    "RT",
+    "SwA",
+    "Vshl",
+    "Facies"
+  ]
+}
