@@ -17,7 +17,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 from matplotlib.colors import BoundaryNorm, ListedColormap
-from matplotlib.patches import FancyBboxPatch, Patch
+from matplotlib.patches import Patch, Rectangle
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import (
@@ -1415,44 +1415,152 @@ def save_artifacts(
 
 def plot_workflow(output_path: Path) -> None:
     set_publication_style()
-    fig, ax = plt.subplots(figsize=(13, 4.8))
+    fig, ax = plt.subplots(figsize=(13.4, 5.0))
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
     ax.axis("off")
 
-    boxes = [
-        (0.10, 0.50, 0.18, 0.18, "Well logs\nQC + harmonization", "#DCEAF4"),
-        (0.30, 0.50, 0.18, 0.18, "Leakage-aware\nblind-well split", "#E9F5DB"),
-        (0.52, 0.68, 0.19, 0.18, "Tabular branch\nRF / GB / XGB", "#D9EAF7"),
-        (0.52, 0.32, 0.23, 0.18, "Sequence branch\n1D-CNN + BiLSTM + Attention", "#FDE2C5"),
-        (0.77, 0.50, 0.17, 0.18, "Probability\nfusion", "#EADFF8"),
-        (0.92, 0.50, 0.17, 0.18, "Blind-well facies\nuncertainty + interpretation", "#F7D9D9"),
-    ]
+    training_zone = Rectangle(
+        (0.03, 0.12),
+        0.69,
+        0.76,
+        linewidth=1.2,
+        linestyle=(0, (4, 3)),
+        edgecolor="#94A3B8",
+        facecolor="#F8FAFC",
+    )
+    ax.add_patch(training_zone)
+    ax.text(0.05, 0.84, "Training wells only", ha="left", va="center", fontsize=12, fontweight="bold", color="#0F172A")
+    ax.text(
+        0.05,
+        0.80,
+        "Scaling, tuning, calibration, probability fusion weights and transition priors are learned inside this zone.",
+        ha="left",
+        va="center",
+        fontsize=9.6,
+        color="#475569",
+    )
 
-    for x, y, w, h, label, color in boxes:
-        patch = FancyBboxPatch(
-            (x - w / 2, y - h / 2),
-            w,
-            h,
-            boxstyle="round,pad=0.02,rounding_size=0.02",
-            linewidth=1.5,
-            edgecolor="#37515f",
-            facecolor=color,
-        )
-        ax.add_patch(patch)
-        ax.text(x, y, label, ha="center", va="center", fontsize=11, color="#22313f")
+    def add_card(
+        x: float,
+        y: float,
+        w: float,
+        h: float,
+        accent: str,
+        title: str,
+        lines: list[str],
+        facecolor: str = "#FFFFFF",
+    ) -> None:
+        ax.add_patch(Rectangle((x, y), w, h, linewidth=1.1, edgecolor="#334155", facecolor=facecolor))
+        ax.add_patch(Rectangle((x, y + h - 0.038), w, 0.038, linewidth=0, facecolor=accent))
+        ax.text(x + 0.016, y + h - 0.06, title, ha="left", va="top", fontsize=11.2, fontweight="bold", color="#0F172A")
+        line_y = y + h - 0.12
+        for line in lines:
+            ax.text(x + 0.018, line_y, line, ha="left", va="top", fontsize=9.6, color="#334155")
+            line_y -= 0.067
 
-    arrows = [
-        ((0.19, 0.50), (0.22, 0.50)),
-        ((0.39, 0.56), (0.43, 0.65)),
-        ((0.39, 0.44), (0.41, 0.35)),
-        ((0.63, 0.62), (0.69, 0.54)),
-        ((0.64, 0.38), (0.69, 0.46)),
-        ((0.85, 0.50), (0.87, 0.50)),
-    ]
-    for start, end in arrows:
-        ax.annotate("", xy=end, xytext=start, arrowprops={"arrowstyle": "->", "lw": 2.0, "color": "#445d6e"})
+    add_card(
+        0.05,
+        0.28,
+        0.16,
+        0.42,
+        "#54728C",
+        "Input logs",
+        [
+            "GR, RHOB, PHID, RT and derived curves",
+            "Quality control and harmonization",
+            "Depth ordering within each well",
+        ],
+    )
+    add_card(
+        0.25,
+        0.28,
+        0.16,
+        0.42,
+        "#5B7F67",
+        "Blind-well protocol",
+        [
+            "Outer leave-one-well-out split",
+            "Inner split for tuning and calibration",
+            "No blind-well labels during training",
+        ],
+    )
 
-    ax.set_title("Hybrid reliable facies-classification workflow", fontsize=15, pad=10)
-    fig.tight_layout()
+    ax.add_patch(Rectangle((0.45, 0.22), 0.23, 0.50, linewidth=1.0, edgecolor="#CBD5E1", facecolor="#F8FAFC"))
+    ax.text(0.466, 0.69, "Complementary modeling", ha="left", va="top", fontsize=11.2, fontweight="bold", color="#0F172A")
+    ax.text(
+        0.466,
+        0.652,
+        "Tabular interactions and vertical continuity are learned in parallel.",
+        ha="left",
+        va="top",
+        fontsize=9.2,
+        color="#475569",
+    )
+    add_card(
+        0.47,
+        0.47,
+        0.19,
+        0.14,
+        "#6687A8",
+        "Tabular branch",
+        [
+            "Random Forest, Gradient Boosting, XGBoost",
+            "Calibrated probabilistic ensemble",
+        ],
+    )
+    add_card(
+        0.47,
+        0.29,
+        0.19,
+        0.14,
+        "#B67B52",
+        "Sequence branch",
+        [
+            "1D-CNN + BiLSTM + attention",
+            "Depth windows and Monte Carlo dropout",
+        ],
+    )
+    add_card(
+        0.50,
+        0.15,
+        0.13,
+        0.10,
+        "#6B7280",
+        "Decision layer",
+        [
+            "Probability fusion",
+            "HMM-style geological smoothing",
+        ],
+        facecolor="#FFFFFF",
+    )
+
+    add_card(
+        0.77,
+        0.28,
+        0.19,
+        0.42,
+        "#3F4D63",
+        "Blind-well outputs",
+        [
+            "Facies track along depth",
+            "Confidence, entropy and margin",
+            "SHAP, attention and sequence diagnostics",
+            "Coverage-risk and contact/thickness error",
+        ],
+        facecolor="#FFFFFF",
+    )
+
+    arrow_style = {"arrowstyle": "-|>", "lw": 1.7, "color": "#64748B", "shrinkA": 6, "shrinkB": 6}
+    ax.annotate("", xy=(0.25, 0.49), xytext=(0.21, 0.49), arrowprops=arrow_style)
+    ax.annotate("", xy=(0.47, 0.54), xytext=(0.41, 0.54), arrowprops=arrow_style)
+    ax.annotate("", xy=(0.47, 0.36), xytext=(0.41, 0.42), arrowprops=arrow_style)
+    ax.annotate("", xy=(0.565, 0.25), xytext=(0.565, 0.47), arrowprops=arrow_style)
+    ax.annotate("", xy=(0.565, 0.25), xytext=(0.565, 0.29), arrowprops=arrow_style)
+    ax.annotate("", xy=(0.77, 0.49), xytext=(0.63, 0.20), arrowprops=arrow_style)
+
+    ax.text(0.77, 0.84, "Blind well kept outside training and tuning", ha="left", va="center", fontsize=10.2, color="#334155")
+    fig.tight_layout(pad=0.6)
     save_figure(fig, output_path)
 
 
