@@ -23,7 +23,6 @@ from sklearn.impute import SimpleImputer
 from sklearn.metrics import (
     accuracy_score,
     balanced_accuracy_score,
-    confusion_matrix,
     f1_score,
     log_loss,
 )
@@ -39,6 +38,8 @@ MAX_EPOCHS = 30
 PATIENCE = 4
 BATCH_SIZE = 128
 MC_PASSES = 10
+SMOOTHING_GRID = [0.0, 0.05, 0.1, 0.2, 0.4, 0.8, 1.2]
+SELECTIVE_COVERAGES = [0.6, 0.7, 0.8, 0.9, 1.0]
 
 FACIES_COLORS = [
     "#264653",
@@ -205,7 +206,7 @@ def load_dataset(config: ExperimentConfig) -> ModelingBundle:
         df.groupby("Well_ID")["Depth"].diff().groupby(df["Well_ID"]).bfill().fillna(0.5)
     )
 
-    # PEF is entirely missing in one well, so it is excluded from the main workflow.
+    # PEF is entirely missing in well A129, so it is excluded from the main workflow.
     feature_cols = [
         "RelDepth",
         "DepthStep",
@@ -358,6 +359,190 @@ def summarize_metrics(y_true: np.ndarray, probs: np.ndarray) -> dict[str, float]
     }
 
 
+def logsumexp_np(arr: np.ndarray, axis: int) -> np.ndarray:
+    max_vals = np.max(arr, axis=axis, keepdims=True)
+    stabilized = np.exp(arr - max_vals)
+    return np.squeeze(max_vals + np.log(np.sum(stabilized, axis=axis, keepdims=True)), axis=axis)
+
+
+def split_contiguous_segments(meta: pd.DataFrame) -> list[np.ndarray]:
+    sorted_meta = meta.reset_index(drop=True).copy()
+    sorted_meta["RowID"] = np.arange(len(sorted_meta))
+    sorted_meta = sorted_meta.sort_values(["Well_ID", "Depth", "RowID"]).reset_index(drop=True)
+    segments: list[np.ndarray] = []
+
+    for _, group in sorted_meta.groupby("Well_ID", sort=False):
+        row_ids = group["RowID"].to_numpy(dtype=int)
+        depths = group["Depth"].to_numpy(dtype=float)
+        if len(row_ids) == 0:
+            continue
+        diffs = np.diff(depths)
+        positive_diffs = diffs[diffs > 0]
+        median_step = float(np.median(positive_diffs)) if len(positive_diffs) else 0.0
+        if median_step > 0:
+            break_points = np.where(diffs > 1.5 * median_step)[0] + 1
+        else:
+            break_points = np.array([], dtype=int)
+        starts = np.concatenate(([0], break_points))
+        ends = np.concatenate((break_points, [len(row_ids)]))
+        for start, end in zip(starts, ends):
+            segments.append(row_ids[start:end])
+    return segments
+
+
+def estimate_transition_prior(
+    meta: pd.DataFrame,
+    labels: np.ndarray,
+    n_classes: int,
+    pseudocount: float = 0.5,
+) -> tuple[np.ndarray, np.ndarray]:
+    start_counts = np.full(n_classes, pseudocount, dtype=float)
+    transition_counts = np.full((n_classes, n_classes), pseudocount, dtype=float)
+    sorted_meta = meta.reset_index(drop=True).copy()
+    sorted_meta["Label"] = labels.astype(int)
+
+    for segment in split_contiguous_segments(sorted_meta):
+        segment_labels = sorted_meta.iloc[segment]["Label"].to_numpy(dtype=int)
+        if len(segment_labels) == 0:
+            continue
+        start_counts[segment_labels[0]] += 1.0
+        for left, right in zip(segment_labels[:-1], segment_labels[1:]):
+            transition_counts[int(left), int(right)] += 1.0
+
+    start_probs = start_counts / start_counts.sum()
+    transition_probs = transition_counts / transition_counts.sum(axis=1, keepdims=True)
+    return start_probs.astype(np.float32), transition_probs.astype(np.float32)
+
+
+def hmm_smooth_segment(
+    probs: np.ndarray,
+    start_probs: np.ndarray,
+    transition_probs: np.ndarray,
+    smoothing_strength: float,
+) -> np.ndarray:
+    probs = normalize_probs(probs)
+    if len(probs) == 0 or smoothing_strength <= 0:
+        return probs
+
+    log_emission = np.log(np.clip(probs, 1e-8, 1.0))
+    log_start = np.log(np.clip(start_probs, 1e-8, 1.0))
+    log_transition = smoothing_strength * np.log(np.clip(transition_probs, 1e-8, 1.0))
+    n_steps, n_classes = probs.shape
+
+    forward = np.zeros((n_steps, n_classes), dtype=np.float64)
+    backward = np.zeros((n_steps, n_classes), dtype=np.float64)
+    forward[0] = log_start + log_emission[0]
+
+    for idx in range(1, n_steps):
+        transition_scores = forward[idx - 1][:, None] + log_transition
+        forward[idx] = log_emission[idx] + logsumexp_np(transition_scores, axis=0)
+
+    for idx in range(n_steps - 2, -1, -1):
+        transition_scores = log_transition + log_emission[idx + 1][None, :] + backward[idx + 1][None, :]
+        backward[idx] = logsumexp_np(transition_scores, axis=1)
+
+    posterior = forward + backward
+    posterior -= logsumexp_np(posterior, axis=1)[:, None]
+    return normalize_probs(np.exp(posterior))
+
+
+def smooth_probabilities_by_well(
+    meta: pd.DataFrame,
+    probs: np.ndarray,
+    start_probs: np.ndarray,
+    transition_probs: np.ndarray,
+    smoothing_strength: float,
+) -> np.ndarray:
+    smoothed = normalize_probs(probs.copy())
+    for segment in split_contiguous_segments(meta):
+        smoothed[segment] = hmm_smooth_segment(
+            probs=smoothed[segment],
+            start_probs=start_probs,
+            transition_probs=transition_probs,
+            smoothing_strength=smoothing_strength,
+        )
+    return normalize_probs(smoothed)
+
+
+def build_boundary_depths(depths: np.ndarray, labels: np.ndarray) -> np.ndarray:
+    if len(labels) < 2:
+        return np.array([], dtype=float)
+    change_mask = labels[1:] != labels[:-1]
+    if not np.any(change_mask):
+        return np.array([], dtype=float)
+    return (depths[1:][change_mask] + depths[:-1][change_mask]) / 2.0
+
+
+def mean_nearest_distance(source: np.ndarray, target: np.ndarray, fallback: float) -> float:
+    if len(source) == 0 and len(target) == 0:
+        return 0.0
+    if len(source) == 0 or len(target) == 0:
+        return float(fallback)
+    distances = np.abs(source[:, None] - target[None, :]).min(axis=1)
+    return float(distances.mean())
+
+
+def summarize_sequence_metrics(model_pred_df: pd.DataFrame, n_classes: int) -> dict[str, float]:
+    thickness_mae = []
+    thickness_rmse = []
+    contact_mae = []
+    transition_count_error = []
+
+    ordered = model_pred_df.sort_values(["Well_ID", "Depth"]).copy()
+    for _, group in ordered.groupby("Well_ID", sort=False):
+        depth = group["Depth"].to_numpy(dtype=float)
+        sample_thickness = group["DepthStep"].to_numpy(dtype=float)
+        y_true = group["TrueEncoded"].to_numpy(dtype=int)
+        y_pred = group["PredEncoded"].to_numpy(dtype=int)
+
+        true_thickness = np.bincount(y_true, weights=sample_thickness, minlength=n_classes)
+        pred_thickness = np.bincount(y_pred, weights=sample_thickness, minlength=n_classes)
+        thickness_diff = pred_thickness - true_thickness
+        thickness_mae.append(float(np.mean(np.abs(thickness_diff))))
+        thickness_rmse.append(float(np.sqrt(np.mean(thickness_diff**2))))
+
+        true_boundaries = build_boundary_depths(depth, y_true)
+        pred_boundaries = build_boundary_depths(depth, y_pred)
+        depth_range = max(float(depth.max() - depth.min()), float(np.median(sample_thickness)))
+        true_to_pred = mean_nearest_distance(true_boundaries, pred_boundaries, fallback=depth_range)
+        pred_to_true = mean_nearest_distance(pred_boundaries, true_boundaries, fallback=depth_range)
+        contact_mae.append((true_to_pred + pred_to_true) / 2.0)
+        transition_count_error.append(float(abs(len(pred_boundaries) - len(true_boundaries))))
+
+    return {
+        "thickness_mae": float(np.mean(thickness_mae)),
+        "thickness_rmse": float(np.mean(thickness_rmse)),
+        "contact_mae": float(np.mean(contact_mae)),
+        "transition_count_error": float(np.mean(transition_count_error)),
+    }
+
+
+def summarize_selective_metrics(
+    y_true: np.ndarray,
+    probs: np.ndarray,
+    coverages: list[float] = SELECTIVE_COVERAGES,
+) -> dict[str, float]:
+    probs = normalize_probs(probs)
+    confidence = probs.max(axis=1)
+    order = np.argsort(-confidence)
+    y_true_sorted = y_true[order]
+    probs_sorted = probs[order]
+    all_labels = list(range(probs.shape[1]))
+    result: dict[str, float] = {}
+
+    for coverage in coverages:
+        n_keep = max(1, int(math.ceil(len(y_true_sorted) * coverage)))
+        kept_true = y_true_sorted[:n_keep]
+        kept_probs = probs_sorted[:n_keep]
+        kept_pred = kept_probs.argmax(axis=1)
+        label = int(round(coverage * 100))
+        result[f"accuracy_at_{label}"] = float(accuracy_score(kept_true, kept_pred))
+        result[f"macro_f1_at_{label}"] = float(
+            f1_score(kept_true, kept_pred, labels=all_labels, average="macro", zero_division=0)
+        )
+    return result
+
+
 def generate_weight_triplets(step: float = 0.1) -> list[tuple[float, float, float]]:
     grid = np.arange(0.0, 1.0 + 1e-9, step)
     weights: list[tuple[float, float, float]] = []
@@ -411,6 +596,40 @@ def choose_hybrid_alpha(tab_probs: np.ndarray, dl_probs: np.ndarray, y_val: np.n
             best_key = key
             best_alpha = float(alpha)
     return best_alpha
+
+
+def choose_smoothing_strength(
+    meta: pd.DataFrame,
+    probs: np.ndarray,
+    y_true: np.ndarray,
+    start_probs: np.ndarray,
+    transition_probs: np.ndarray,
+    n_classes: int,
+) -> float:
+    best_strength = 0.0
+    best_key = (-1.0, -math.inf, math.inf)
+
+    for strength in SMOOTHING_GRID:
+        smoothed = smooth_probabilities_by_well(
+            meta=meta,
+            probs=probs,
+            start_probs=start_probs,
+            transition_probs=transition_probs,
+            smoothing_strength=float(strength),
+        )
+        preds = smoothed.argmax(axis=1)
+        macro_f1 = f1_score(y_true, preds, average="macro", zero_division=0)
+        neg_log_loss = -log_loss(y_true, smoothed, labels=list(range(smoothed.shape[1])))
+        temp_df = meta[["Well_ID", "Depth", "DepthStep"]].copy()
+        temp_df["TrueEncoded"] = y_true
+        temp_df["PredEncoded"] = preds
+        contact_mae = summarize_sequence_metrics(temp_df, n_classes)["contact_mae"]
+        key = (macro_f1, neg_log_loss, -contact_mae)
+        if key > best_key:
+            best_key = key
+            best_strength = float(strength)
+
+    return best_strength
 
 
 class CNNClassifier(nn.Module):
@@ -691,7 +910,7 @@ def build_prediction_frame(
     extra: dict[str, np.ndarray | float] | None = None,
 ) -> pd.DataFrame:
     probs = normalize_probs(probs)
-    out = meta[["Well_ID", "Formation", "Depth", "RelDepth", "Facies"]].copy()
+    out = meta[["Well_ID", "Formation", "Depth", "RelDepth", "DepthStep", "Facies"]].copy()
     out["Validation"] = validation_name
     out["SplitLabel"] = split_label
     out["Model"] = model_name
@@ -744,15 +963,32 @@ def evaluate_split(
     x_seq_train = transform_sequence(bundle.x_seq_raw[train_idx], imputer, scaler)
     x_seq_test = transform_sequence(bundle.x_seq_raw[test_idx], imputer, scaler)
 
+    meta_subtrain = bundle.core_df.iloc[subtrain_idx].reset_index(drop=True)
+    meta_val = bundle.core_df.iloc[val_idx].reset_index(drop=True)
+    meta_train = bundle.core_df.iloc[train_idx].reset_index(drop=True)
+    meta_test = bundle.core_df.iloc[test_idx].reset_index(drop=True)
+
     y_sub = bundle.y_encoded[subtrain_idx]
     y_val = bundle.y_encoded[val_idx]
     y_train = bundle.y_encoded[train_idx]
     y_test = bundle.y_encoded[test_idx]
 
+    sub_start_probs, sub_transition_probs = estimate_transition_prior(
+        meta=meta_subtrain,
+        labels=y_sub,
+        n_classes=n_classes,
+    )
+    train_start_probs, train_transition_probs = estimate_transition_prior(
+        meta=meta_train,
+        labels=y_train,
+        n_classes=n_classes,
+    )
+
     print(f"[{validation_name}] {split_label}: training tabular models", flush=True)
     tabular_models = train_tabular_models(x_tab_sub, y_sub, seed)
     val_tab_probs = {name: model.predict_proba(x_tab_val) for name, model in tabular_models.items()}
     tab_weights = choose_tabular_ensemble_weights(val_tab_probs, y_val)
+    ensemble_val_probs = apply_weighted_fusion(val_tab_probs, tab_weights)
 
     tabular_models = train_tabular_models(x_tab_train, y_train, seed)
     test_tab_probs = {name: model.predict_proba(x_tab_test) for name, model in tabular_models.items()}
@@ -810,15 +1046,50 @@ def evaluate_split(
 
     print(f"[{validation_name}] {split_label}: building hybrid fusion", flush=True)
     hybrid_alpha = choose_hybrid_alpha(
-        apply_weighted_fusion(val_tab_probs, tab_weights),
+        ensemble_val_probs,
         dl_extra_outputs["CNN_BiLSTM_Attention"]["ValProbs"],
         y_val,
+    )
+    hybrid_val_probs = normalize_probs(
+        hybrid_alpha * ensemble_val_probs
+        + (1.0 - hybrid_alpha) * dl_extra_outputs["CNN_BiLSTM_Attention"]["ValProbs"]
     )
     hybrid_test_probs = normalize_probs(
         hybrid_alpha * ensemble_test_probs + (1.0 - hybrid_alpha) * dl_test_probs["CNN_BiLSTM_Attention"]
     )
 
-    meta_test = bundle.core_df.iloc[test_idx].reset_index(drop=True)
+    print(f"[{validation_name}] {split_label}: applying geological smoothing", flush=True)
+    geo_ensemble_strength = choose_smoothing_strength(
+        meta=meta_val,
+        probs=ensemble_val_probs,
+        y_true=y_val,
+        start_probs=sub_start_probs,
+        transition_probs=sub_transition_probs,
+        n_classes=n_classes,
+    )
+    geo_hybrid_strength = choose_smoothing_strength(
+        meta=meta_val,
+        probs=hybrid_val_probs,
+        y_true=y_val,
+        start_probs=sub_start_probs,
+        transition_probs=sub_transition_probs,
+        n_classes=n_classes,
+    )
+    geo_ensemble_test_probs = smooth_probabilities_by_well(
+        meta=meta_test,
+        probs=ensemble_test_probs,
+        start_probs=train_start_probs,
+        transition_probs=train_transition_probs,
+        smoothing_strength=geo_ensemble_strength,
+    )
+    geo_hybrid_test_probs = smooth_probabilities_by_well(
+        meta=meta_test,
+        probs=hybrid_test_probs,
+        start_probs=train_start_probs,
+        transition_probs=train_transition_probs,
+        smoothing_strength=geo_hybrid_strength,
+    )
+
     predictions = [
         build_prediction_frame(
             meta=meta_test,
@@ -855,6 +1126,16 @@ def evaluate_split(
             model_name="ProbabilisticEnsemble",
             validation_name=validation_name,
             split_label=split_label,
+        ),
+        build_prediction_frame(
+            meta=meta_test,
+            probs=geo_ensemble_test_probs,
+            y_encoded=y_test,
+            label_encoder=bundle.label_encoder,
+            model_name="GeoConstrainedEnsemble",
+            validation_name=validation_name,
+            split_label=split_label,
+            extra={"GeoStrength": geo_ensemble_strength},
         ),
         build_prediction_frame(
             meta=meta_test,
@@ -898,6 +1179,19 @@ def evaluate_split(
                 "DLVariance": dl_extra_outputs["CNN_BiLSTM_Attention"]["EpistemicVariance"],
             },
         ),
+        build_prediction_frame(
+            meta=meta_test,
+            probs=geo_hybrid_test_probs,
+            y_encoded=y_test,
+            label_encoder=bundle.label_encoder,
+            model_name="GeoConstrainedHybrid",
+            validation_name=validation_name,
+            split_label=split_label,
+            extra={
+                "DLVariance": dl_extra_outputs["CNN_BiLSTM_Attention"]["EpistemicVariance"],
+                "GeoStrength": geo_hybrid_strength,
+            },
+        ),
     ]
     prediction_df = pd.concat(predictions, ignore_index=True)
 
@@ -907,6 +1201,8 @@ def evaluate_split(
         probs = model_pred_df[probs_cols].to_numpy()
         y_true = model_pred_df["TrueEncoded"].to_numpy()
         row = summarize_metrics(y_true, probs)
+        row.update(summarize_sequence_metrics(model_pred_df, n_classes=n_classes))
+        row.update(summarize_selective_metrics(y_true, probs))
         row.update(
             {
                 "Validation": validation_name,
@@ -915,16 +1211,22 @@ def evaluate_split(
                 "n_samples": len(model_pred_df),
             }
         )
+        if "GeoStrength" in model_pred_df.columns and model_pred_df["GeoStrength"].notna().any():
+            row["geo_strength"] = float(model_pred_df["GeoStrength"].dropna().iloc[0])
         metrics_rows.append(row)
 
     artifacts = {
         "tab_weights": tab_weights,
         "hybrid_alpha": hybrid_alpha,
+        "geo_ensemble_strength": geo_ensemble_strength,
+        "geo_hybrid_strength": geo_hybrid_strength,
         "attention_weights": dl_extra_outputs["CNN_BiLSTM_Attention"]["AttentionWeights"],
         "representative_meta": meta_test,
         "xgb_model": tabular_models["XGBoost"],
         "x_tab_train": x_tab_train,
         "feature_names": bundle.feature_cols,
+        "start_probs": train_start_probs,
+        "transition_matrix": train_transition_probs,
     }
     return prediction_df, metrics_rows, artifacts
 
@@ -982,9 +1284,24 @@ def aggregate_metrics(metrics_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFr
         "mean_entropy",
         "mean_confidence",
         "mean_margin",
+        "thickness_mae",
+        "thickness_rmse",
+        "contact_mae",
+        "transition_count_error",
+        "accuracy_at_60",
+        "macro_f1_at_60",
+        "accuracy_at_70",
+        "macro_f1_at_70",
+        "accuracy_at_80",
+        "macro_f1_at_80",
+        "accuracy_at_90",
+        "macro_f1_at_90",
+        "accuracy_at_100",
+        "macro_f1_at_100",
     ]
+    optional_cols = [col for col in metric_cols if col in metrics_df.columns]
     summary = (
-        metrics_df.groupby(["Validation", "Model"], as_index=False)[metric_cols]
+        metrics_df.groupby(["Validation", "Model"], as_index=False)[optional_cols]
         .mean()
         .sort_values(["Validation", "macro_f1"], ascending=[True, False])
     )
@@ -1017,6 +1334,17 @@ def save_artifacts(
     metrics_df.to_csv(config.results_dir / "metrics_by_split.csv", index=False)
     summary_df.to_csv(config.results_dir / "metrics_summary.csv", index=False)
     per_split_df.to_csv(config.results_dir / "metrics_per_split.csv", index=False)
+    selective_curves_df = build_selective_curves(
+        predictions_df=predictions_df,
+        validation_name="BlindWell",
+        model_names=[
+            "ProbabilisticEnsemble",
+            "GeoConstrainedEnsemble",
+            "HybridFusion",
+            "GeoConstrainedHybrid",
+        ],
+    )
+    selective_curves_df.to_csv(config.results_dir / "selective_curves_blindwell.csv", index=False)
     with open(config.results_dir / "label_mapping.json", "w", encoding="utf-8") as fp:
         json.dump(
             {
@@ -1054,7 +1382,6 @@ def save_artifacts(
     facies_labels = [int(label) for label in bundle.label_encoder.classes_]
     print("[Artifacts] rendering workflow figures", flush=True)
     plot_workflow(config.figures_dir / "figure_1_workflow.png")
-    plot_window_construction(config.figures_dir / "figure_2_window.png", bundle, config.window_size)
     plot_random_vs_blind(summary_df, config.figures_dir / "figure_3_random_vs_blind.png")
     plot_model_comparison(summary_df, config.figures_dir / "figure_4_model_comparison.png")
     print(f"[Artifacts] rendering depth and uncertainty figures for {representative_well}", flush=True)
@@ -1082,9 +1409,8 @@ def save_artifacts(
         representative_well=representative_well,
         output_path=config.figures_dir / "figure_7_shap_attention.png",
     )
-    plot_petrophysical_crossplots(bundle.df, facies_labels, config.figures_dir / "figure_8_crossplots.png")
-    plot_confusion_matrices(predictions_df, facies_labels, config.figures_dir / "figure_9_confusion_matrices.png")
-    plot_facies_context(bundle.df, facies_labels, config.figures_dir / "figure_10_dataset_context.png")
+    plot_sequence_value(summary_df, config.figures_dir / "figure_8_sequence_value.png")
+    plot_selective_prediction(selective_curves_df, config.figures_dir / "figure_9_selective_prediction.png")
 
 
 def plot_workflow(output_path: Path) -> None:
@@ -1130,46 +1456,20 @@ def plot_workflow(output_path: Path) -> None:
     save_figure(fig, output_path)
 
 
-def plot_window_construction(output_path: Path, bundle: ModelingBundle, window_size: int) -> None:
-    set_publication_style()
-    well = bundle.df["Well_ID"].iloc[0]
-    group = bundle.df[bundle.df["Well_ID"] == well].head(30).copy()
-    half = window_size // 2
-    center = half + 4
-    left_depth = group.iloc[center - half]["Depth"]
-    right_depth = group.iloc[center + half]["Depth"]
-
-    fig, axes = plt.subplots(2, 1, figsize=(10.5, 5.8), sharex=True, gridspec_kw={"hspace": 0.08})
-    tracks = [
-        ("GR", "#2A6F97", "Gamma ray"),
-        ("RT", "#9C6644", "True resistivity"),
-    ]
-    for ax, (column, color, title) in zip(axes, tracks):
-        ax.plot(group["Depth"], group[column], color=color, lw=2)
-        ax.axvspan(left_depth, right_depth, color="#F4D58D", alpha=0.35)
-        ax.axvline(group.iloc[center]["Depth"], color="#C1121F", ls="--", lw=1.8)
-        ax.set_ylabel(title)
-        ax.text(group.iloc[center]["Depth"], ax.get_ylim()[1], " target ", color="#C1121F", ha="left", va="top")
-    axes[1].set_xlabel("Depth")
-    fig.suptitle(f"Depth-centered window used by the sequence model ({well})", y=0.99)
-    fig.tight_layout()
-    save_figure(fig, output_path)
-
-
 def plot_random_vs_blind(summary_df: pd.DataFrame, output_path: Path) -> None:
     set_publication_style()
-    model_order = ["RandomForest", "ProbabilisticEnsemble", "CNN_BiLSTM_Attention", "HybridFusion"]
+    model_order = ["RandomForest", "ProbabilisticEnsemble", "GeoConstrainedEnsemble", "GeoConstrainedHybrid"]
     model_labels = {
         "RandomForest": "RF",
         "ProbabilisticEnsemble": "Ensemble",
-        "CNN_BiLSTM_Attention": "CNN-BiLSTM-Attn",
-        "HybridFusion": "Hybrid",
+        "GeoConstrainedEnsemble": "Geo-Ensemble",
+        "GeoConstrainedHybrid": "Geo-Hybrid",
     }
     plot_df = summary_df[summary_df["Model"].isin(model_order)].copy()
     fig, axes = plt.subplots(1, 2, figsize=(12.5, 5.2), sharey=True)
 
     for ax, (metric, title) in zip(axes, [("accuracy", "Accuracy"), ("macro_f1", "Macro-F1")]):
-        pivot = plot_df.pivot(index="Model", columns="Validation", values=metric).loc[model_order]
+        pivot = plot_df.pivot(index="Model", columns="Validation", values=metric).reindex(model_order)
         y = np.arange(len(model_order))
         ax.hlines(y, pivot["BlindWell"], pivot["RandomSplit"], color="#c7c7c7", lw=2.2, zorder=1)
         ax.scatter(
@@ -1210,18 +1510,20 @@ def plot_random_vs_blind(summary_df: pd.DataFrame, output_path: Path) -> None:
 def plot_model_comparison(summary_df: pd.DataFrame, output_path: Path) -> None:
     set_publication_style()
     blind_df = summary_df[summary_df["Validation"] == "BlindWell"].copy()
-    blind_df = blind_df.set_index("Model").loc[
+    blind_df = blind_df.set_index("Model").reindex(
         [
             "RandomForest",
             "ProbabilisticEnsemble",
+            "GeoConstrainedEnsemble",
             "XGBoost",
             "GradientBoosting",
             "HybridFusion",
+            "GeoConstrainedHybrid",
             "CNN_BiLSTM_Attention",
             "CNN_BiLSTM",
             "CNN",
         ]
-    ]
+    ).dropna(how="all")
     fig, axes = plt.subplots(1, 2, figsize=(12.8, 5.3), gridspec_kw={"width_ratios": [2.2, 1.2]})
     higher_better = blind_df[["accuracy", "balanced_accuracy", "macro_f1", "weighted_f1"]]
     lower_better = blind_df[["log_loss", "brier_score"]]
@@ -1244,18 +1546,27 @@ def plot_depth_predictions(
     subset = predictions_df[
         (predictions_df["Validation"] == "BlindWell")
         & (predictions_df["SplitLabel"] == f"Blind_{well_id}")
-        & (predictions_df["Model"].isin(["ProbabilisticEnsemble", "CNN_BiLSTM_Attention", "HybridFusion"]))
+        & (
+            predictions_df["Model"].isin(
+                [
+                    "ProbabilisticEnsemble",
+                    "GeoConstrainedEnsemble",
+                    "HybridFusion",
+                    "GeoConstrainedHybrid",
+                ]
+            )
+        )
     ].copy()
     logs = bundle.core_df[bundle.core_df["Well_ID"] == well_id].sort_values("Depth").copy()
-    truth = subset[subset["Model"] == "HybridFusion"].sort_values("Depth")
+    truth = subset[subset["Model"] == "GeoConstrainedHybrid"].sort_values("Depth")
     facies_labels, facies_colors, cmap, norm, index_map = get_facies_style(facies_labels)
 
     fig, axes = plt.subplots(
         1,
-        7,
-        figsize=(15.5, 9.2),
+        8,
+        figsize=(18.2, 9.2),
         sharey=True,
-        gridspec_kw={"width_ratios": [1.35, 1.15, 1.35, 0.36, 0.36, 0.36, 0.36], "wspace": 0.08},
+        gridspec_kw={"width_ratios": [1.35, 1.15, 1.35, 0.40, 0.40, 0.40, 0.40, 0.40], "wspace": 0.08},
     )
 
     depth = logs["Depth"].to_numpy()
@@ -1284,16 +1595,16 @@ def plot_depth_predictions(
         index_map,
         cmap,
         norm,
-        "Ensemble",
+        "Ens.",
     )
     draw_facies_strip(
         axes[5],
         truth["Depth"].to_numpy(),
-        subset[subset["Model"] == "CNN_BiLSTM_Attention"].sort_values("Depth")["PredFacies"],
+        subset[subset["Model"] == "GeoConstrainedEnsemble"].sort_values("Depth")["PredFacies"],
         index_map,
         cmap,
         norm,
-        "DL",
+        "Geo-Ens.",
     )
     draw_facies_strip(
         axes[6],
@@ -1304,10 +1615,19 @@ def plot_depth_predictions(
         norm,
         "Hybrid",
     )
+    draw_facies_strip(
+        axes[7],
+        truth["Depth"].to_numpy(),
+        subset[subset["Model"] == "GeoConstrainedHybrid"].sort_values("Depth")["PredFacies"],
+        index_map,
+        cmap,
+        norm,
+        "Geo-Hyb.",
+    )
 
     for ax in axes[:3]:
         ax.set_ylim(depth.max(), depth.min())
-    fig.suptitle(f"Blind-well multi-track panel: {well_id}", y=0.99)
+    fig.suptitle(f"Blind-well multi-track panel: {well_id}", y=0.985)
     add_facies_legend(fig, facies_labels, facies_colors, anchor_y=0.01)
     fig.tight_layout(rect=[0, 0.05, 1, 0.98])
     save_figure(fig, output_path)
@@ -1323,7 +1643,7 @@ def plot_uncertainty(
     subset = predictions_df[
         (predictions_df["Validation"] == "BlindWell")
         & (predictions_df["SplitLabel"] == f"Blind_{well_id}")
-        & (predictions_df["Model"] == "HybridFusion")
+        & (predictions_df["Model"] == "GeoConstrainedHybrid")
     ].copy().sort_values("Depth")
     facies_labels, facies_colors, cmap, norm, index_map = get_facies_style(facies_labels)
     prob_cols = [f"Prob_{label}" for label in facies_labels]
@@ -1338,7 +1658,7 @@ def plot_uncertainty(
     )
     depth = subset["Depth"].to_numpy()
     draw_facies_strip(axes[0], depth, subset["Facies"], index_map, cmap, norm, "True", show_ylabel=True)
-    draw_facies_strip(axes[1], depth, subset["PredFacies"], index_map, cmap, norm, "Hybrid")
+    draw_facies_strip(axes[1], depth, subset["PredFacies"], index_map, cmap, norm, "Geo-Hybrid")
 
     heatmap = axes[2].imshow(
         prob_matrix,
@@ -1349,7 +1669,7 @@ def plot_uncertainty(
         interpolation="nearest",
         extent=[-0.5, len(facies_labels) - 0.5, float(depth.max()), float(depth.min())],
     )
-    axes[2].set_title("Hybrid class probabilities")
+    axes[2].set_title("Geo-Hybrid class probabilities")
     axes[2].set_xticks(np.arange(len(facies_labels)))
     axes[2].set_xticklabels([str(label) for label in facies_labels], rotation=45, ha="right")
     axes[2].set_xlabel("Facies")
@@ -1370,7 +1690,7 @@ def plot_uncertainty(
 
     cbar = fig.colorbar(heatmap, ax=axes[2], fraction=0.045, pad=0.02)
     cbar.set_label("Probability")
-    fig.suptitle(f"Hybrid probability and uncertainty diagnostics: {well_id}", y=0.99)
+    fig.suptitle(f"Geo-hybrid probability and uncertainty diagnostics: {well_id}", y=0.99)
     add_facies_legend(fig, facies_labels, facies_colors, anchor_y=0.01)
     fig.tight_layout(rect=[0, 0.05, 1, 0.98])
     save_figure(fig, output_path)
@@ -1431,153 +1751,171 @@ def plot_shap_and_attention(
     save_figure(fig, output_path)
 
 
-def plot_petrophysical_crossplots(raw_df: pd.DataFrame, facies_labels: list[int], output_path: Path) -> None:
-    set_publication_style()
-    sample_df = raw_df.sample(n=min(3500, len(raw_df)), random_state=SEED).copy()
-    facies_labels, facies_colors, _, _, _ = get_facies_style(facies_labels)
-    color_map = dict(zip(facies_labels, facies_colors))
+def build_selective_curves(
+    predictions_df: pd.DataFrame,
+    validation_name: str,
+    model_names: list[str],
+    coverages: list[float] | None = None,
+) -> pd.DataFrame:
+    if coverages is None:
+        coverages = list(np.linspace(0.5, 1.0, 11))
 
-    panels = [
-        ("GR", "PHID", "GR vs PHID", "linear"),
-        ("RHOB", "PHIE", "RHOB vs PHIE", "linear"),
-        ("RT", "PHIE", "RT vs PHIE", "log"),
-        ("Vshl", "SwA", "Vshl vs SwA", "linear"),
-    ]
-    fig, axes = plt.subplots(2, 2, figsize=(12.5, 10.2))
-    for ax, (x_col, y_col, title, scale) in zip(axes.ravel(), panels):
-        panel_df = sample_df[[x_col, y_col, "Facies"]].dropna().copy()
-        if scale == "log":
-            panel_df = panel_df[panel_df[x_col] > 0]
-        for facies in facies_labels:
-            subset = panel_df[panel_df["Facies"] == facies]
-            ax.scatter(
-                subset[x_col],
-                subset[y_col],
-                s=16,
-                alpha=0.40,
-                color=color_map[facies],
-                edgecolor="none",
+    rows: list[dict[str, float | str]] = []
+    subset = predictions_df[
+        (predictions_df["Validation"] == validation_name) & (predictions_df["Model"].isin(model_names))
+    ].copy()
+
+    for (model_name, split_label), group in subset.groupby(["Model", "SplitLabel"], sort=False):
+        probs_cols = [col for col in group.columns if col.startswith("Prob_")]
+        probs = normalize_probs(group[probs_cols].to_numpy())
+        y_true = group["TrueEncoded"].to_numpy(dtype=int)
+        confidence = probs.max(axis=1)
+        order = np.argsort(-confidence)
+        probs = probs[order]
+        y_true = y_true[order]
+        all_labels = list(range(probs.shape[1]))
+
+        for coverage in coverages:
+            n_keep = max(1, int(math.ceil(len(group) * coverage)))
+            kept_probs = probs[:n_keep]
+            kept_true = y_true[:n_keep]
+            kept_pred = kept_probs.argmax(axis=1)
+            rows.append(
+                {
+                    "Validation": validation_name,
+                    "Model": model_name,
+                    "SplitLabel": split_label,
+                    "Coverage": float(coverage),
+                    "Accuracy": float(accuracy_score(kept_true, kept_pred)),
+                    "MacroF1": float(
+                        f1_score(
+                            kept_true,
+                            kept_pred,
+                            labels=all_labels,
+                            average="macro",
+                            zero_division=0,
+                        )
+                    ),
+                }
             )
-        centroids = panel_df.groupby("Facies")[[x_col, y_col]].median().reindex(facies_labels)
-        ax.scatter(
-            centroids[x_col],
-            centroids[y_col],
-            s=90,
-            c=[color_map[label] for label in facies_labels],
-            edgecolor="black",
-            linewidth=0.7,
-            marker="X",
-            zorder=4,
-        )
-        if scale == "log":
-            ax.set_xscale("log")
-        ax.set_xlabel(x_col)
-        ax.set_ylabel(y_col)
-        ax.set_title(title)
 
-    legend_handles = [
-        Patch(facecolor=color_map[label], edgecolor="none", label=f"Facies {label}")
-        for label in facies_labels
-    ]
-    fig.legend(handles=legend_handles, loc="lower center", ncol=min(4, len(legend_handles)), frameon=False)
-    fig.suptitle("Petrophysical crossplots from the anonymized reservoir dataset", y=0.99)
-    fig.tight_layout(rect=[0, 0.05, 1, 0.98])
-    save_figure(fig, output_path)
+    return pd.DataFrame(rows)
 
 
-def plot_confusion_matrices(predictions_df: pd.DataFrame, facies_labels: list[int], output_path: Path) -> None:
+def plot_sequence_value(summary_df: pd.DataFrame, output_path: Path) -> None:
     set_publication_style()
-    blind_df = predictions_df[predictions_df["Validation"] == "BlindWell"].copy()
-    model_order = ["RandomForest", "ProbabilisticEnsemble", "CNN_BiLSTM_Attention", "HybridFusion"]
-    model_labels = {
+    model_order = [
+        "RandomForest",
+        "ProbabilisticEnsemble",
+        "GeoConstrainedEnsemble",
+        "HybridFusion",
+        "GeoConstrainedHybrid",
+    ]
+    label_map = {
         "RandomForest": "RF",
         "ProbabilisticEnsemble": "Ensemble",
-        "CNN_BiLSTM_Attention": "CNN-BiLSTM-Attn",
+        "GeoConstrainedEnsemble": "Geo-Ensemble",
         "HybridFusion": "Hybrid",
+        "GeoConstrainedHybrid": "Geo-Hybrid",
     }
+    blind_df = (
+        summary_df[summary_df["Validation"] == "BlindWell"]
+        .set_index("Model")
+        .reindex(model_order)
+        .dropna(how="all")
+        .reset_index()
+    )
+    blind_df["Label"] = blind_df["Model"].map(label_map)
 
-    fig, axes = plt.subplots(2, 2, figsize=(10.5, 9.2), sharex=True, sharey=True)
-    cbar_ax = fig.add_axes([0.92, 0.18, 0.02, 0.64])
-    for idx, (ax, model_name) in enumerate(zip(axes.ravel(), model_order)):
-        subset = blind_df[blind_df["Model"] == model_name]
-        cm = confusion_matrix(
-            subset["Facies"],
-            subset["PredFacies"],
-            labels=facies_labels,
-            normalize="true",
-        )
-        sns.heatmap(
-            cm,
-            annot=True,
-            fmt=".2f",
-            cmap="Blues",
-            vmin=0.0,
-            vmax=1.0,
+    fig, axes = plt.subplots(1, 3, figsize=(14.5, 4.8), sharey=True)
+    metrics = [
+        ("contact_mae", "Contact displacement\n(lower is better)", "Mean absolute depth error"),
+        ("thickness_mae", "Facies thickness error\n(lower is better)", "Mean absolute thickness error"),
+        ("transition_count_error", "Over-segmentation\n(lower is better)", "Absolute transition-count error"),
+    ]
+    palette = sns.color_palette("crest", len(blind_df))
+
+    for ax, (metric, title, xlabel) in zip(axes, metrics):
+        sns.barplot(
+            data=blind_df,
+            y="Label",
+            x=metric,
+            hue="Label",
+            palette=palette,
+            dodge=False,
+            legend=False,
             ax=ax,
-            xticklabels=facies_labels,
-            yticklabels=facies_labels,
-            cbar=idx == 0,
-            cbar_ax=cbar_ax if idx == 0 else None,
+            orient="h",
         )
-        ax.set_title(model_labels[model_name])
-        ax.set_xlabel("Predicted facies")
-        ax.set_ylabel("True facies")
-    fig.suptitle("Blind-well confusion matrices (row-normalized)", y=0.98)
-    fig.tight_layout(rect=[0, 0, 0.91, 0.97])
+        ax.set_title(title)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel("")
+
+    fig.suptitle("Blind-well geological utility beyond aggregate accuracy", y=0.98)
+    fig.tight_layout()
     save_figure(fig, output_path)
 
 
-def plot_facies_context(raw_df: pd.DataFrame, facies_labels: list[int], output_path: Path) -> None:
+def plot_selective_prediction(selective_df: pd.DataFrame, output_path: Path) -> None:
     set_publication_style()
-    facies_labels, facies_colors, cmap, norm, index_map = get_facies_style(facies_labels)
-    wells = sorted(raw_df["Well_ID"].unique())
-    formation_dist = (
-        pd.crosstab(raw_df["Formation"], raw_df["Facies"], normalize="index")
-        .reindex(columns=facies_labels, fill_value=0.0)
-        .sort_index()
+    model_order = [
+        "ProbabilisticEnsemble",
+        "GeoConstrainedEnsemble",
+        "HybridFusion",
+        "GeoConstrainedHybrid",
+    ]
+    label_map = {
+        "ProbabilisticEnsemble": "Ensemble",
+        "GeoConstrainedEnsemble": "Geo-Ensemble",
+        "HybridFusion": "Hybrid",
+        "GeoConstrainedHybrid": "Geo-Hybrid",
+    }
+    plot_df = (
+        selective_df[selective_df["Model"].isin(model_order)]
+        .groupby(["Model", "Coverage"], as_index=False)[["Accuracy", "MacroF1"]]
+        .mean()
     )
+    plot_df["Label"] = plot_df["Model"].map(label_map)
 
-    fig = plt.figure(figsize=(14.5, 6.0))
-    grid = fig.add_gridspec(1, len(wells) + 1, width_ratios=[0.32] * len(wells) + [1.8], wspace=0.10)
-    strip_axes = [fig.add_subplot(grid[0, idx]) for idx in range(len(wells))]
-    heatmap_ax = fig.add_subplot(grid[0, -1])
-
-    for idx, (ax, well_id) in enumerate(zip(strip_axes, wells)):
-        well_df = raw_df[raw_df["Well_ID"] == well_id].sort_values("RelDepth")
-        draw_facies_strip(
-            ax,
-            well_df["RelDepth"].to_numpy(),
-            well_df["Facies"],
-            index_map,
-            cmap,
-            norm,
-            well_id.replace("_", "\n"),
-            show_ylabel=idx == 0,
-        )
-        if idx == 0:
-            ax.set_ylabel("Relative depth")
-
-    sns.heatmap(
-        formation_dist,
-        annot=True,
-        fmt=".2f",
-        cmap="YlGnBu",
-        vmin=0.0,
-        vmax=max(0.5, float(formation_dist.max().max())),
-        ax=heatmap_ax,
-        cbar_kws={"shrink": 0.75, "label": "Within-formation fraction"},
+    fig, axes = plt.subplots(1, 2, figsize=(12.8, 4.8), sharex=True)
+    sns.lineplot(
+        data=plot_df,
+        x="Coverage",
+        y="Accuracy",
+        hue="Label",
+        marker="o",
+        linewidth=2,
+        ax=axes[0],
     )
-    heatmap_ax.set_title("Facies composition by formation")
-    heatmap_ax.set_xlabel("Facies")
-    heatmap_ax.set_ylabel("Formation")
-    add_facies_legend(fig, facies_labels, facies_colors, anchor_y=-0.01)
-    fig.suptitle("Dataset context: relative-depth facies architecture and stratigraphic composition", y=0.99)
-    fig.tight_layout(rect=[0, 0.04, 1, 0.97])
+    sns.lineplot(
+        data=plot_df,
+        x="Coverage",
+        y="MacroF1",
+        hue="Label",
+        marker="o",
+        linewidth=2,
+        ax=axes[1],
+    )
+    axes[0].set_title("Coverage-risk curve: accuracy")
+    axes[1].set_title("Coverage-risk curve: macro-F1")
+    for ax in axes:
+        ax.set_xlabel("Coverage retained")
+        ax.set_xlim(0.48, 1.02)
+        ax.grid(True, alpha=0.25)
+    axes[0].set_ylabel("Accuracy")
+    axes[1].set_ylabel("Macro-F1")
+    handles, labels = axes[0].get_legend_handles_labels()
+    axes[0].legend(handles, labels, loc="lower right", frameon=True)
+    axes[1].get_legend().remove()
+    fig.suptitle("Selective prediction from blind-well confidence", y=0.98)
+    fig.tight_layout()
     save_figure(fig, output_path)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the blind-well hybrid facies experiment.")
+    parser = argparse.ArgumentParser(
+        description="Run the geologically constrained blind-well facies experiment."
+    )
     parser.add_argument(
         "--data-path",
         type=Path,

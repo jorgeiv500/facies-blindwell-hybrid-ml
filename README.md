@@ -1,29 +1,45 @@
-# Facies Blind-Well Hybrid ML
+# Facies Blind-Well Geologically Constrained ML
 
-Reproducible repository for blind-well facies classification from anonymized well logs. The repository contains:
+Reproducible public repository for blind-well facies classification from anonymized well logs.
 
-- an anonymized version of the dataset used in the study
-- a leakage-aware experiment pipeline with tabular, sequence-aware, and hybrid models
-- exported metrics and figures generated from the public anonymized data
+This version of the repository matches the experiment currently used by the manuscript:
+
+- leakage-aware blind-well validation
+- strong tabular baselines and sequence-aware deep models
+- geologically constrained sequence decoding from training-well facies transitions
+- uncertainty-aware selective prediction
+- reservoir-oriented diagnostics such as contact displacement and facies thickness error
 
 ## Headline Results
 
 Average performance on the anonymized public dataset:
 
-| Validation | Best model by macro-F1 | Accuracy | Macro-F1 | Balanced accuracy |
-|:--|:--|--:|--:|--:|
-| BlindWell | `RandomForest` | 0.927 | 0.788 | 0.803 |
-| BlindWell | `ProbabilisticEnsemble` | 0.922 | 0.785 | 0.816 |
-| BlindWell | `HybridFusion` | 0.907 | 0.756 | 0.790 |
-| BlindWell | `CNN_BiLSTM_Attention` | 0.818 | 0.596 | 0.637 |
-| RandomSplit | `HybridFusion` | 0.967 | 0.800 | 0.804 |
+| Validation | Model | Accuracy | Balanced accuracy | Macro-F1 | Log-loss |
+|:--|:--|--:|--:|--:|--:|
+| BlindWell | `GeoConstrainedEnsemble` | 0.925 | 0.819 | 0.791 | 0.275 |
+| BlindWell | `RandomForest` | 0.927 | 0.803 | 0.788 | 0.270 |
+| BlindWell | `ProbabilisticEnsemble` | 0.922 | 0.816 | 0.785 | 0.256 |
+| BlindWell | `GeoConstrainedHybrid` | 0.907 | 0.790 | 0.756 | 0.277 |
+| RandomSplit | `GeoConstrainedHybrid` | 0.967 | 0.804 | 0.800 | 0.120 |
 
-Interpretation:
+Main interpretation:
 
-- random splitting is optimistic compared with blind-well evaluation
-- strong tree ensembles remain the most reliable cross-well baselines on this dataset
-- the attention-based deep branch improves over simpler sequence models but does not dominate the tabular baselines under blind-well testing
-- the hybrid branch is complementary rather than universally superior
+- random splitting remains optimistic relative to blind-well evaluation
+- the strongest blind-well operating point is not a raw classifier but the geologically constrained ensemble
+- the geological prior improves average blind-well macro-F1 and balanced accuracy without using blind-well labels
+- deep learning remains informative as a complementary sequence-aware branch, but it is not the dominant blind-well model on this six-well dataset
+
+Representative blind-well behavior:
+
+- the representative case is `Well_06`, the hardest blind well for the hybrid family in this run
+- in `Well_06`, `GeoConstrainedEnsemble` improves accuracy from `0.874` to `0.895` and macro-F1 from `0.599` to `0.641` relative to `ProbabilisticEnsemble`
+- the learned geological smoothing strength for `Well_06` is `0.40`, while it remains `0.00` in easier folds where smoothing is unnecessary
+
+Geological utility and selective prediction:
+
+- `GeoConstrainedEnsemble` reduces average contact displacement from `1.283` to `1.189` depth units relative to `ProbabilisticEnsemble`
+- `GeoConstrainedEnsemble` reduces average facies thickness error from `4.976` to `4.571`
+- at `80%` retained coverage, `GeoConstrainedEnsemble` reaches `0.972` accuracy and `0.743` strict all-class macro-F1
 
 ## What This Repository Reproduces
 
@@ -32,11 +48,13 @@ The experiment compares:
 - `RandomForest`
 - `GradientBoosting`
 - `XGBoost`
-- a validation-weighted probabilistic ensemble
-- `1D-CNN`
+- `ProbabilisticEnsemble`
+- `GeoConstrainedEnsemble`
+- `CNN`
 - `CNN_BiLSTM`
 - `CNN_BiLSTM_Attention`
-- a probability-level hybrid fusion between the ensemble and the attention-based deep model
+- `HybridFusion`
+- `GeoConstrainedHybrid`
 
 Two validation protocols are reported:
 
@@ -60,7 +78,8 @@ Two validation protocols are reported:
 ├── docs/
 │   └── RESULTS_SUMMARY.md
 ├── requirements.txt
-└── README.md
+├── LICENSE
+└── CITATION.cff
 ```
 
 ## Data Anonymization
@@ -89,42 +108,42 @@ Run the full experiment:
 python src/run_hybrid_experiment.py
 ```
 
-Outputs will be written to:
-
-- `outputs/results`
-- `outputs/figures`
-
-Figures are exported in both `.png` and `.pdf` formats so the public repository can be reused directly in manuscripts, slides, and peer-review responses.
-
-## Figure Inventory
-
-The figure set is designed around what reservoir characterization and applied ML journals typically expect: depth-based prediction tracks, blind-well diagnostics, petrophysical context, uncertainty, and interpretability.
-
-- `figure_1_workflow`: hybrid leakage-aware workflow
-- `figure_2_window`: depth-window construction for the sequence model
-- `figure_3_random_vs_blind`: optimism gap between random split and blind-well validation
-- `figure_4_model_comparison`: blind-well metric comparison across models
-- `figure_5_depth_predictions`: multi-track blind-well panel with GR, PHID, RT, and facies strips
-- `figure_6_uncertainty`: hybrid class probabilities, confidence, entropy, margin, and MC-dropout variance
-- `figure_7_shap_attention`: SHAP-based feature ranking and attention profile
-- `figure_8_crossplots`: petrophysical crossplots colored by facies
-- `figure_9_confusion_matrices`: row-normalized blind-well confusion matrices
-- `figure_10_dataset_context`: relative-depth facies architecture by well and facies composition by formation
-
-## Rebuild the Public Dataset
-
-If you have legitimate access to the private source spreadsheet, you can regenerate the public dataset with:
+Optional path overrides:
 
 ```bash
-python src/anonymize_dataset.py --input-path /path/to/private_source.xlsx
+python src/run_hybrid_experiment.py \
+  --data-path data/facies_logs_anonymized.csv \
+  --results-dir outputs/results \
+  --figures-dir outputs/figures
 ```
+
+Machine-readable outputs are written to:
+
+- `outputs/results/metrics_summary.csv`
+- `outputs/results/metrics_per_split.csv`
+- `outputs/results/metrics_by_split.csv`
+- `outputs/results/predictions_all.csv`
+- `outputs/results/selective_curves_blindwell.csv`
+
+## Main Figure Set
+
+The public figure set was reduced to the figures actively used by the current manuscript and response package.
+
+- `figure_1_workflow`: leakage-aware workflow and modeling path
+- `figure_3_random_vs_blind`: optimism gap between random split and blind-well validation
+- `figure_4_model_comparison`: blind-well metric comparison across raw and geologically constrained models
+- `figure_5_depth_predictions`: multi-track blind-well panel with GR, PHID, RT, and facies strips
+- `figure_6_uncertainty`: geo-hybrid class probabilities, confidence, entropy, margin, and MC-dropout variance
+- `figure_7_shap_attention`: SHAP-based feature ranking and attention profile
+- `figure_8_sequence_value`: contact displacement, thickness error, and over-segmentation
+- `figure_9_selective_prediction`: coverage-risk curves for selective prediction
 
 ## Transparency Notes
 
-- The experiment never uses blind-well samples during preprocessing, tuning, or probability fusion.
-- `PEF` is excluded from the main modeling workflow because it is completely missing in one well.
-- The public repository is intended to make the computational workflow auditable and rerunnable from anonymized data.
-- The public dataset does not include well coordinates or structural surfaces, so the repository avoids pseudo-maps or reservoir reconstructions that would not be supported by the released data.
+- no blind-well samples are used during preprocessing, tuning, calibration, or geological smoothing estimation
+- `PEF` is excluded from the main modeling workflow because it is completely missing in one well
+- geological transition priors are learned only from training wells and tuned only on inner validation data
+- the public dataset does not include well coordinates or structural surfaces, so the repository does not claim spatial reservoir reconstruction
 
 ## Tested Environment
 
